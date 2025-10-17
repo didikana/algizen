@@ -1,0 +1,257 @@
+
+# ALGi-zen Simulation Module
+# Author: Doğukan Arısan
+# Description:
+#   Self-contained simulation of microalgae façade dynamics:
+#   - CO2 concentration C(t) in the reactor / façade channel
+#   - Biomass (photosynthetic) density P(t)
+#   Equations:
+#       dC/dt = -k1 * P(t) * A + D * (C_in - C)
+#       dP/dt = k2 * I(t) * (1 - P/Pmax) - k3 * P
+#   with a configurable irradiance profile I(t).
+#
+# Usage (CLI):
+#   python simulation.py --tmax 48 --dt 0.05 --profile diurnal --save out.csv --plot
+#
+# Notes:
+#   - This file is standalone; it does not require external data.
+#   - The default parameters are placeholder values for demonstration.
+#   - For research use, calibrate parameters with experimental data.
+# ---------------------------------------------------------------
+
+from __future__ import annotations
+import argparse
+import csv
+import json
+from dataclasses import dataclass, asdict
+from typing import Callable, Tuple, List
+
+import math
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+
+@dataclass
+class Params:
+    # Physical / model parameters
+    k1: float = 1.2e-4     # CO2 uptake coeff (ppm·m^2)/(g·L·s)
+    k2: float = 6.0e-3     # Growth gain coeff (1/(W·m^-2·s))
+    k3: float = 1.0e-3     # Natural decay (1/s)
+    D: float = 4.0e-4      # Diffusion rate to ambient (1/s)
+    A: float = 1.0         # Effective surface area (m^2)
+    Cin: float = 420.0     # Ambient CO2 (ppm)
+    Pmax: float = 5.0      # Carrying capacity (g/L)
+
+    # Irradiance profile parameters
+    I0: float = 300.0      # Peak light (W/m^2) for diurnal profile
+    photoperiod: float = 24.0  # Hours per full day/night cycle (h)
+    day_fraction: float = 0.6  # Fraction of cycle with light (0..1)
+
+
+def irradiance_constant(I0: float) -> Callable[[float], float]:
+    """Constant irradiance profile."""
+    def I(t: float) -> float:
+        return I0
+    return I
+
+
+def irradiance_diurnal(I0: float, period_h: float = 24.0, day_fraction: float = 0.6) -> Callable[[float], float]:
+    """
+    Simple diurnal profile:
+      - Sine ramp during "day" window
+      - Zero outside day window
+    Time t is in hours for the profile convenience.
+    """
+    day_len = day_fraction * period_h
+
+    def I(t: float) -> float:
+        # Map time to [0, period)
+        tau = t % period_h
+        if tau <= day_len:
+            # Smooth half-sine from 0 -> I0 -> 0 across the daylight window
+            phase = math.pi * (tau / day_len)
+            return I0 * math.sin(phase)
+        else:
+            return 0.0
+
+    return I
+
+
+def rhs(t_h: float, state: Tuple[float, float], params: Params, I_fn: Callable[[float], float]) -> Tuple[float, float]:
+    """
+    Right-hand side of the ODE system.
+    Inputs:
+      t_h   : time in hours (for convenience with diurnal profile)
+      state : (C, P)
+    Returns:
+      (dCdt, dPdt) in units per HOUR (not per second), to keep dt in hours.
+    """
+    C, P = state
+
+    # Convert coefficients that were given per-second into per-hour where necessary
+    sec_to_hour = 3600.0
+    k1 = params.k1 * sec_to_hour
+    k2 = params.k2 * sec_to_hour
+    k3 = params.k3 * sec_to_hour
+    D  = params.D  * sec_to_hour
+
+    I = I_fn(t_h)  # irradiance W/m^2
+
+    dCdt = -k1 * P * params.A + D * (params.Cin - C)
+    dPdt = k2 * I * (1.0 - P / params.Pmax) - k3 * P
+
+    return dCdt, dPdt
+
+
+def rk4_step(t: float, y: Tuple[float, float], h: float, f: Callable[[float, Tuple[float, float]], Tuple[float, float]]):
+    """One step of classic RK4 for a 2D state."""
+    k1 = f(t, y)
+    k2 = f(t + 0.5 * h, (y[0] + 0.5 * h * k1[0], y[1] + 0.5 * h * k1[1]))
+    k3 = f(t + 0.5 * h, (y[0] + 0.5 * h * k2[0], y[1] + 0.5 * h * k2[1]))
+    k4 = f(t + h,       (y[0] + h * k3[0],       y[1] + h * k3[1]))
+    y_next = (
+        y[0] + (h / 6.0) * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]),
+        y[1] + (h / 6.0) * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]),
+    )
+    return y_next
+
+
+def simulate(
+    tmax_h: float = 72.0,
+    dt_h: float = 0.1,
+    C0: float = 420.0,
+    P0: float = 0.5,
+    params: Params | None = None,
+    profile: str = "diurnal",
+    I0: float = 300.0,
+    photoperiod_h: float = 24.0,
+    day_fraction: float = 0.6,
+) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Run the simulation and return time (hours), C(t), P(t).
+    """
+    params = params or Params()
+
+    if profile == "constant":
+        I_fn = irradiance_constant(I0)
+    elif profile == "diurnal":
+        I_fn = irradiance_diurnal(I0, photoperiod_h, day_fraction)
+    else:
+        raise ValueError("profile must be 'constant' or 'diurnal'")
+
+    # Wrap RHS with bound parameters
+    f = lambda t, y: rhs(t, y, params, I_fn)
+
+    t = 0.0
+    C, P = C0, P0
+
+    times = [t]
+    Cs = [C]
+    Ps = [P]
+
+    n_steps = int(tmax_h / dt_h)
+    for _ in range(n_steps):
+        C, P = rk4_step(t, (C, P), dt_h, f)
+        t += dt_h
+        # Clamp physical ranges
+        C = max(0.0, C)
+        P = max(0.0, min(P, params.Pmax))
+        times.append(t)
+        Cs.append(C)
+        Ps.append(P)
+
+    return times, Cs, Ps
+
+
+def save_csv(path: str, times: List[float], Cs: List[float], Ps: List[float], meta: dict | None = None):
+    """Save results to CSV with a simple header row. Meta is written as JSON in a comment line."""
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        if meta:
+            writer.writerow([f"# meta={json.dumps(meta)}"])
+        writer.writerow(["time_h", "C_ppm", "P_g_per_L"])
+        for t, c, p in zip(times, Cs, Ps):
+            writer.writerow([f"{t:.6f}", f"{c:.6f}", f"{p:.6f}"])
+
+
+def plot_results(times: List[float], Cs: List[float], Ps: List[float]):
+    """
+    Plot results using matplotlib.
+    IMPORTANT: We generate separate figures for each series to avoid subplots.
+    We do not set any specific colors or styles.
+    """
+    if plt is None:
+        print("matplotlib is not available; skipping plots.")
+        return
+
+    # CO2 concentration plot
+    plt.figure()
+    plt.plot(times, Cs, label="CO2 (ppm)")
+    plt.xlabel("Time (hours)")
+    plt.ylabel("CO2 (ppm)")
+    plt.title("CO2 Concentration vs Time")
+    plt.legend()
+    plt.tight_layout()
+
+    # Biomass plot
+    plt.figure()
+    plt.plot(times, Ps, label="Biomass P (g/L)")
+    plt.xlabel("Time (hours)")
+    plt.ylabel("Biomass (g/L)")
+    plt.title("Biomass Density vs Time")
+    plt.legend()
+    plt.tight_layout()
+
+    plt.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ALGi-zen microalgae façade simulator")
+    parser.add_argument("--tmax", type=float, default=72.0, help="Total simulation time in hours")
+    parser.add_argument("--dt", type=float, default=0.1, help="Time step in hours")
+    parser.add_argument("--C0", type=float, default=420.0, help="Initial CO2 concentration (ppm)")
+    parser.add_argument("--P0", type=float, default=0.5, help="Initial biomass density (g/L)")
+    parser.add_argument("--profile", type=str, choices=["constant", "diurnal"], default="diurnal", help="Irradiance profile")
+    parser.add_argument("--I0", type=float, default=300.0, help="Peak irradiance for the profile (W/m^2)")
+    parser.add_argument("--photoperiod", type=float, default=24.0, help="Hours per day/night cycle (for diurnal)")
+    parser.add_argument("--dayfrac", type=float, default=0.6, help="Daylight fraction (0..1) for diurnal")
+    parser.add_argument("--save", type=str, default="", help="Path to save CSV results")
+    parser.add_argument("--plot", action="store_true", help="Show matplotlib plots")
+    parser.add_argument("--params", type=str, default="", help="Path to JSON file to override Params")
+
+    args = parser.parse_args()
+
+    p = Params()
+    if args.params:
+        with open(args.params, "r") as f:
+            user = json.load(f)
+        for k, v in user.items():
+            if hasattr(p, k):
+                setattr(p, k, float(v))
+
+    times, Cs, Ps = simulate(
+        tmax_h=args.tmax,
+        dt_h=args.dt,
+        C0=args.C0,
+        P0=args.P0,
+        params=p,
+        profile=args.profile,
+        I0=args.I0,
+        photoperiod_h=args.photoperiod,
+        day_fraction=args.dayfrac,
+    )
+
+    meta = {"params": asdict(p), "profile": args.profile, "I0": args.I0, "photoperiod_h": args.photoperiod, "day_fraction": args.dayfrac}
+    if args.save:
+        save_csv(args.save, times, Cs, Ps, meta=meta)
+        print(f"Saved results to {args.save}")
+
+    if args.plot:
+        plot_results(times, Cs, Ps)
+
+
+if __name__ == "__main__":
+    main()

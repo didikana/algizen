@@ -1,0 +1,446 @@
+
+"""
+ALGi-zen Visualization Module
+Author: Doğukan Arısan
+
+Purpose
+-------
+Research-grade plotting utilities for ALGi-zen. This module focuses on
+transparent, reproducible visualizations of simulation and optimization results.
+It is intentionally explicit and verbose to make plots auditable for a
+scientific audience.
+
+Key principles
+--------------
+1) Uses matplotlib only. No seaborn or global styles.
+2) Each chart is created in its own figure (no subplots).
+3) No explicit color selections unless the user requests it.
+4) Functions are pure where possible and return the created Figure for saving.
+
+Contents
+--------
+- CSV loaders for simulation and optimization outputs.
+- Time-series plots for CO2 and biomass.
+- Irradiance profile reconstruction and plotting.
+- Phase portrait (P vs. C).
+- Heatmaps for 2D parameter sweeps.
+- Histograms and scatter plots for optimization studies.
+- Markdown report generator that references saved figures.
+
+CLI
+---
+Examples:
+  # Plot standard figures from a simulation CSV
+  python visualization.py --sim_csv results.csv --outdir plots --standard
+
+  # Plot optimization study convergence and param vs score
+  python visualization.py --study_csv grid_results.csv --outdir plots --convergence --scatter I0 score
+
+  # Generate a Markdown report from a simulation CSV
+  python visualization.py --sim_csv results.csv --outdir report --standard --md_report SIM_REPORT.md
+
+Notes
+-----
+This module intentionally avoids tight coupling with other modules. It replicates
+a few small helper functions (e.g., I(t) reconstruction) to keep it standalone.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+
+# =============================================================================
+# Data structures
+# =============================================================================
+
+@dataclass
+class SimData:
+    time_h: List[float]
+    C_ppm: List[float]
+    P_g_per_L: List[float]
+    meta: Dict[str, Any]
+
+
+@dataclass
+class StudyTrialRow:
+    score: float
+    params: Dict[str, float]
+    extras: Dict[str, Any]  # co2_removed, energy_cost, etc.
+
+
+# =============================================================================
+# CSV Loaders
+# =============================================================================
+
+def load_sim_csv(path: str | Path) -> SimData:
+    """
+    Load a simulation CSV exported by simulation.save_csv.
+    The first row optionally contains a meta comment with JSON.
+    """
+    path = Path(path)
+    meta: Dict[str, Any] = {}
+    times: List[float] = []
+    Cs: List[float] = []
+    Ps: List[float] = []
+
+    with path.open("r", newline="") as f:
+        reader = csv.reader(f)
+        first = next(reader, None)
+        if first and first[0].startswith("# meta="):
+            try:
+                meta = json.loads(first[0].split("=", 1)[1])
+            except Exception:
+                meta = {}
+            header = next(reader, None)  # skip header
+        else:
+            header = first
+
+        if not header or header[:3] != ["time_h", "C_ppm", "P_g_per_L"]:
+            raise ValueError("Unexpected simulation CSV header. Expected: time_h,C_ppm,P_g_per_L")
+
+        for row in reader:
+            if not row:
+                continue
+            times.append(float(row[0]))
+            Cs.append(float(row[1]))
+            Ps.append(float(row[2]))
+
+    return SimData(time_h=times, C_ppm=Cs, P_g_per_L=Ps, meta=meta)
+
+
+def load_study_csv(path: str | Path) -> List[StudyTrialRow]:
+    """
+    Load an optimization study CSV exported by optimization.save_study_csv.
+    Returns a list of rows with flattened parameter dicts.
+    """
+    path = Path(path)
+    rows: List[StudyTrialRow] = []
+
+    with path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        for d in reader:
+            score = float(d.get("score", "nan"))
+            params: Dict[str, float] = {}
+            extras: Dict[str, Any] = {}
+            for k, v in d.items():
+                if k == "score":
+                    continue
+                if k in {"co2_removed", "energy_cost", "nutrient_cost"}:
+                    extras[k] = float(v) if v != "" else float("nan")
+                elif k in {"tmax_h", "dt_h", "I0", "photoperiod_h", "day_fraction"}:
+                    extras[k] = float(v) if v != "" else float("nan")
+                elif k in {"profile"}:
+                    extras[k] = v
+                elif k == "meta":
+                    extras[k] = v
+                else:
+                    # Attempt to parse as float param; fallback to raw string
+                    try:
+                        params[k] = float(v)
+                    except Exception:
+                        extras[k] = v
+            rows.append(StudyTrialRow(score=score, params=params, extras=extras))
+
+    return rows
+
+
+# =============================================================================
+# Irradiance reconstruction (keep module standalone)
+# =============================================================================
+
+def irradiance_series(profile: str, I0: float, photoperiod_h: float, day_fraction: float, times: Sequence[float]) -> List[float]:
+    """
+    Compute I(t) consistent with the diurnal/constant profiles.
+    No explicit colors or styles are set in any plot using this data.
+    """
+    def I_constant(_: float) -> float:
+        return I0
+
+    def I_diurnal(t: float) -> float:
+        tau = t % photoperiod_h
+        day_len = day_fraction * photoperiod_h
+        if tau <= day_len:
+            phase = math.pi * (tau / day_len)
+            return I0 * math.sin(phase)
+        return 0.0
+
+    if profile == "constant":
+        fn = I_constant
+    else:
+        fn = I_diurnal
+    return [fn(t) for t in times]
+
+
+# =============================================================================
+# Core plotting helpers
+# =============================================================================
+
+def _new_fig() -> matplotlib.figure.Figure:
+    """
+    Create a new figure. We do not set style or colors.
+    """
+    fig = plt.figure()
+    return fig
+
+
+def plot_time_series(x: Sequence[float], y: Sequence[float], ylabel: str, title: str, label: Optional[str] = None) -> matplotlib.figure.Figure:
+    """
+    Plot a simple time series (single figure, single axes). Returns the Figure.
+    """
+    fig = _new_fig()
+    plt.plot(x, y, label=label if label else None)
+    plt.xlabel("Time (hours)")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    if label:
+        plt.legend()
+    plt.tight_layout()
+    return fig
+
+
+def plot_dual_series(x: Sequence[float], y1: Sequence[float], y2: Sequence[float],
+                     label1: str, label2: str, ylabel: str, title: str) -> matplotlib.figure.Figure:
+    """
+    Plot two lines on the same axes (still a single figure). No subplots.
+    """
+    fig = _new_fig()
+    plt.plot(x, y1, label=label1)
+    plt.plot(x, y2, label=label2)
+    plt.xlabel("Time (hours)")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    return fig
+
+
+def plot_phase_portrait(C: Sequence[float], P: Sequence[float], title: str = "Phase Portrait (P vs C)") -> matplotlib.figure.Figure:
+    """
+    Plot phase portrait: P vs C. Single figure with a line.
+    """
+    fig = _new_fig()
+    plt.plot(C, P, label="Trajectory")
+    plt.xlabel("CO2 (ppm)")
+    plt.ylabel("Biomass P (g/L)")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    return fig
+
+
+def plot_histogram(data: Sequence[float], bins: int = 30, xlabel: str = "Value", title: str = "Histogram") -> matplotlib.figure.Figure:
+    """
+    Plot a basic histogram for distributions of scores or parameters.
+    """
+    fig = _new_fig()
+    plt.hist(list(data), bins=bins)
+    plt.xlabel(xlabel)
+    plt.ylabel("Count")
+    plt.title(title)
+    plt.tight_layout()
+    return fig
+
+
+def plot_scatter(x: Sequence[float], y: Sequence[float], xlabel: str, ylabel: str, title: str, label: Optional[str] = None) -> matplotlib.figure.Figure:
+    """
+    Scatter plot useful for param vs score charts.
+    """
+    fig = _new_fig()
+    plt.scatter(list(x), list(y), label=label if label else None)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    if label:
+        plt.legend()
+    plt.tight_layout()
+    return fig
+
+
+def plot_heatmap(Z: List[List[float]], xticks: Sequence[float], yticks: Sequence[float],
+                 xlabel: str, ylabel: str, title: str) -> matplotlib.figure.Figure:
+    """
+    Plot a heatmap (imshow). Single figure; default colormap only.
+    """
+    fig = _new_fig()
+    import numpy as np
+    Zarr = np.array(Z, dtype=float)
+    plt.imshow(Zarr, origin="lower", aspect="auto",
+               extent=[min(xticks), max(xticks), min(yticks), max(yticks)])
+    plt.colorbar()
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    return fig
+
+
+# =============================================================================
+# High-level research plots
+# =============================================================================
+
+def plot_sim_standard(sim: SimData) -> Dict[str, matplotlib.figure.Figure]:
+    """
+    Create a standard set of figures for a single simulation run.
+    Returns a dict {name: Figure}.
+    """
+    figs: Dict[str, matplotlib.figure.Figure] = {}
+    t = sim.time_h
+    C = sim.C_ppm
+    P = sim.P_g_per_L
+
+    figs["co2"] = plot_time_series(t, C, ylabel="CO2 (ppm)", title="CO2 vs Time")
+    figs["biomass"] = plot_time_series(t, P, ylabel="Biomass P (g/L)", title="Biomass vs Time")
+    figs["phase"] = plot_phase_portrait(C, P, title="Phase Portrait (P vs C)")
+
+    # If meta contains profile info, reconstruct I(t)
+    try:
+        meta = sim.meta.get("params", {})
+        profile = sim.meta.get("profile", "diurnal")
+        I0 = float(sim.meta.get("I0", 300.0))
+        photoperiod_h = float(sim.meta.get("photoperiod_h", 24.0))
+        day_fraction = float(sim.meta.get("day_fraction", 0.6))
+        I = irradiance_series(profile, I0, photoperiod_h, day_fraction, t)
+        figs["irradiance"] = plot_time_series(t, I, ylabel="Irradiance (W/m^2)", title=f"Irradiance Profile [{profile}]")
+    except Exception:
+        pass
+
+    return figs
+
+
+def plot_study_convergence(rows: List[StudyTrialRow], window: int = 25) -> Dict[str, matplotlib.figure.Figure]:
+    """
+    Convergence plot for optimization study and distribution of scores.
+    """
+    figs: Dict[str, matplotlib.figure.Figure] = {}
+    scores = [r.score for r in rows]
+
+    # Score vs trial index
+    fig1 = _new_fig()
+    plt.plot(range(len(scores)), scores, label="trial scores")
+    if len(scores) >= window:
+        mv = []
+        for i in range(len(scores)):
+            lo = max(0, i - window + 1)
+            mv.append(sum(scores[lo:i+1]) / (i - lo + 1))
+        plt.plot(range(len(scores)), mv, label="moving average")
+    plt.xlabel("Trial")
+    plt.ylabel("Utility score")
+    plt.title("Optimization Convergence")
+    plt.legend()
+    plt.tight_layout()
+    figs["convergence"] = fig1
+
+    # Histogram of scores
+    figs["score_hist"] = plot_histogram(scores, bins=30, xlabel="Utility score", title="Score Distribution")
+
+    return figs
+
+
+def plot_param_vs_score(rows: List[StudyTrialRow], param: str) -> matplotlib.figure.Figure:
+    """
+    Scatter of a given parameter vs score.
+    """
+    xs: List[float] = []
+    ys: List[float] = []
+    for r in rows:
+        if param in r.params:
+            xs.append(r.params[param])
+            ys.append(r.score)
+    fig = plot_scatter(xs, ys, xlabel=param, ylabel="Utility score", title=f"{param} vs Utility")
+    return fig
+
+
+# =============================================================================
+# IO helpers
+# =============================================================================
+
+def save_figures(figs: Dict[str, matplotlib.figure.Figure], outdir: str | Path, prefix: str = "") -> Dict[str, Path]:
+    """
+    Save a dict of figures to disk. Returns dict of {name: path}.
+    """
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    saved: Dict[str, Path] = {}
+    for name, fig in figs.items():
+        filename = f"{prefix + '_' if prefix else ''}{name}.png"
+        path = outdir / filename
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+        saved[name] = path
+    return saved
+
+
+def write_markdown_report(saved: Dict[str, Path], path: str | Path, title: str = "ALGi-zen Report", notes: Optional[str] = None) -> Path:
+    """
+    Write a simple Markdown report referencing the saved figures.
+    """
+    path = Path(path)
+    lines: List[str] = []
+    lines.append(f"# {title}\n")
+    if notes:
+        lines.append(notes.strip() + "\n")
+    for name, p in saved.items():
+        lines.append(f"## {name}\n")
+        lines.append(f"![{name}]({p.name})\n")
+    path.write_text("\n".join(lines))
+    return path
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="ALGi-zen visualization utilities")
+    p.add_argument("--sim_csv", type=str, default="", help="Simulation CSV to visualize")
+    p.add_argument("--study_csv", type=str, default="", help="Optimization study CSV to visualize")
+    p.add_argument("--outdir", type=str, default="plots", help="Directory to save figures")
+    p.add_argument("--standard", action="store_true", help="Produce standard simulation plots")
+    p.add_argument("--convergence", action="store_true", help="Plot optimization convergence")
+    p.add_argument("--scatter", nargs=2, metavar=("PARAM", "SCORE_LABEL"), help="Plot parameter vs score (SCORE_LABEL ignored, kept for symmetry)")
+    p.add_argument("--md_report", type=str, default="", help="Write a Markdown report with saved figures")
+    p.add_argument("--prefix", type=str, default="", help="Filename prefix for saved figures")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = parse_args(argv)
+
+    saved: Dict[str, Path] = {}
+    outdir = args.outdir
+
+    if args.sim_csv:
+        sim = load_sim_csv(args.sim_csv)
+        if args.standard:
+            figs = plot_sim_standard(sim)
+            saved |= save_figures(figs, outdir, prefix=args.prefix)
+
+    if args.study_csv:
+        rows = load_study_csv(args.study_csv)
+        if args.convergence:
+            figs = plot_study_convergence(rows)
+            saved |= save_figures(figs, outdir, prefix=args.prefix)
+        if args.scatter:
+            param = args.scatter[0]
+            fig = plot_param_vs_score(rows, param)
+            saved |= save_figures({f"scatter_{param}": fig}, outdir, prefix=args.prefix)
+
+    if args.md_report and saved:
+        md_path = Path(outdir) / args.md_report
+        write_markdown_report(saved, md_path, title="ALGi-zen Visualization Report")
+
+    if not saved:
+        print("No figures produced. Pass --standard with --sim_csv or --convergence/--scatter with --study_csv.")
+
+
+if __name__ == "__main__":
+    main()
